@@ -1,0 +1,11 @@
+name: tarea3-hpc
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.13
+  - numpy
+  - scipy
+  - mpi4py
+  - mpich
+  - threadpoolctl
