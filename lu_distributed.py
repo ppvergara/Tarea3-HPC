@@ -1,8 +1,8 @@
-"""Grid bloque-cíclico y fase diagonal/paneles MPI (Etapa 3, sin Schur).
+"""LU distribuida bloque-cíclica funcional (Etapa 4, sin tiempos definitivos).
 
 Ejemplo: mpiexec -n 4 python lu_distributed.py --N 32 --b 8 --pr 2 --pc 2
-La CLI solo inicializa; diagonal_panel_step es la interfaz numérica reutilizable.
-Hilos BLAS configurados externamente. Las pruebas están en tests/. No hay LU completa.
+La CLI factoriza in-place mediante diagonal/paneles y Schur local.
+Hilos BLAS configurados externamente. Verificación numérica en tests/.
 """
 
 import argparse
@@ -47,8 +47,8 @@ def validate_parameters(comm, params):
                          f'{params.pr * params.pc}.')
     if params.check:
         raise ValueError('--check está reservado para verificar LU; '
-                         'la Etapa 3 todavía no implementa LU completa. '
-                         'Use tests/test_distribution.py para la distribución.')
+                         'su integración corresponde a la Etapa 5. '
+                         'Use tests/test_lu_complete.py para verificar la Etapa 4.')
 
 
 class _ParseExit(Exception):
@@ -72,7 +72,7 @@ def parse_parameters(comm, argv=None):
     parser.add_argument('--pr', type=int, required=True)
     parser.add_argument('--pc', type=int, required=True)
     parser.add_argument('--check', action='store_true',
-                        help='reservado para LU completa; se rechaza en Etapa 3')
+                        help='reservado para Etapa 5; usar tests/test_lu_complete.py')
     captured = io.StringIO()
     try:
         with redirect_stdout(captured):
@@ -326,6 +326,68 @@ def diagonal_panel_step(grid, local, k):
         raise  # Solo alcanzable si un comunicador de prueba retorna de Abort.
 
 
+def schur_update(local, panels):
+    """Actualizar in-place SOLO los bloques i,j > panels.k, sin comunicación.
+
+    Consume StepPanels del paso actual: lower (m,b), upper (b,n) y los
+    slices básicos de la región activa (m,n). La vista puede tener strides;
+    no se copia ni se exige contigüidad C de esa región. Una sola operación
+    @ por región no vacía; con m=0 o n=0 no se multiplica.
+
+    Las excepciones son locales: el llamador colectivo debe abortar el
+    trabajo MPI, como hace lu_blocked_distributed, sin intentar recuperarlo
+    mediante colectivas que otros ranks podrían no estar esperando.
+    """
+    layout, a = local.layout, local.values
+    if not isinstance(panels.k, (int, np.integer)) or not 0 <= panels.k < layout.nb:
+        raise ValueError('k de Schur debe estar entre 0 y nb-1.')
+    if (a.shape != layout.shape or a.dtype != np.float64 or not a.flags.writeable):
+        raise ValueError('Schur requiere matriz local float64 escribible de shape layout.shape.')
+    if (panels.row_slice, panels.col_slice) != layout.active_slices(panels.k):
+        raise ValueError('Slices de Schur incompatibles con la región i,j > k.')
+    active = a[panels.row_slice, panels.col_slice]
+    m, n = active.shape
+    b = layout.params.b
+    if (panels.lower.shape != (m, b) or panels.upper.shape != (b, n) or
+            panels.lower.dtype != np.float64 or panels.upper.dtype != np.float64):
+        raise ValueError('Schur requiere lower (m,b), upper (b,n) float64 y active (m,n).')
+    if not m or not n:
+        return
+    # NumPy escribe sobre la vista original aun cuando no sea C contigua.
+    # El único temporal grande es el producto (m,n), sin copia previa de active.
+    with np.errstate(over='raise', invalid='raise'):
+        active -= panels.lower @ panels.upper
+    if not np.isfinite(active).all():
+        raise FloatingPointError('Actualización de Schur con NaN/Inf.')
+
+
+def lu_blocked_distributed(grid, local):
+    """LU completa in-place; todos los ranks recorren k=0,...,nb-1.
+
+    Requiere matriz original local, grid/layout compatibles y parámetros
+    colectivamente validados. Cada rank completa su Schur antes de llamar
+    al paso siguiente. Las Bcast bloqueantes entregan los paneles necesarios;
+    no se añaden barreras ni otras comunicaciones. Conserva local.values.
+    """
+    k, phase = None, 'validación local'
+    try:
+        if local.layout.params != grid.params:
+            raise ValueError('Layout y grid incompatibles para LU completa.')
+        for k in range(grid.params.N // grid.params.b):
+            phase = 'diagonal/paneles'
+            panels = diagonal_panel_step(grid, local, k)
+            phase = 'actualización de Schur'
+            schur_update(local, panels)
+    except Exception:
+        print(f'Error en lu_blocked_distributed: rank={grid.rank} '
+              f'coords=({grid.myrow},{grid.mycol}) k={k} fase={phase}; MPI Abort(1)',
+              file=sys.stderr, flush=True)
+        traceback.print_exc()
+        sys.stderr.flush()
+        grid.comm.Abort(1)
+        raise
+
+
 def main(argv=None):
     comm = MPI.COMM_WORLD
     try:
@@ -341,12 +403,11 @@ def main(argv=None):
             return 0
         grid = ProcessGrid.create(comm, params)
         local = LocalMatrix.initialize(grid)
-        if comm.Get_rank() == 0:
-            print(f'Etapa 3: inicialización local N={params.N} b={params.b} '
-                  f'grid={params.pr}x{params.pc}; LU no implementada.')
-        # Mantener el almacenamiento disponible para las siguientes etapas.
-        del local
+        lu_blocked_distributed(grid, local)
         grid.free()
+        if comm.Get_rank() == 0:
+            print(f'Etapa 4: LU distribuida finalizada N={params.N} b={params.b} '
+                  f'grid={params.pr}x{params.pc}; verificación independiente en tests/.')
         return 0
     except Exception as exc:
         print(f'Error inesperado en rank {comm.Get_rank()}: {exc}; MPI Abort(1)', file=sys.stderr,

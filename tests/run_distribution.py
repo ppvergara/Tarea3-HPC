@@ -1,4 +1,4 @@
-"""Batería local reproducible de Etapa 2; no ejecuta LU ni benchmarks.
+"""Batería de distribución de Etapa 2; incluye smoke de la CLI actual.
 
 Usar el Python del entorno MPI; --output debe ser un directorio nuevo.
 """
@@ -132,8 +132,8 @@ def main():
                     record['noncontiguous_active_views'] = sum(
                         not region['c_contiguous'] and all(region['shape'])
                         for r in result['ranks'] for region in r['active'])
-                elif category == 'cli' and 'LU no implementada' not in stdout:
-                    raise ValueError('Falta diagnóstico de etapa sin LU')
+                elif category == 'cli' and 'LU distribuida finalizada' not in stdout:
+                    raise ValueError('Falta diagnóstico de finalización de LU')
                 elif category == 'help' and '--pr' not in stdout:
                     raise ValueError('Falta ayuda')
             record['status'] = 'passed'
