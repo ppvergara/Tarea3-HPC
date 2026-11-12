@@ -1,7 +1,8 @@
-"""Etapa 2: grid MPI e inicialización bloque-cíclica 2D. Aún no implementa LU.
+"""Grid bloque-cíclico y fase diagonal/paneles MPI (Etapa 3, sin Schur).
 
 Ejemplo: mpiexec -n 4 python lu_distributed.py --N 32 --b 8 --pr 2 --pc 2
-Hilos BLAS configurados externamente. Las pruebas están en tests/.
+La CLI solo inicializa; diagonal_panel_step es la interfaz numérica reutilizable.
+Hilos BLAS configurados externamente. Las pruebas están en tests/. No hay LU completa.
 """
 
 import argparse
@@ -9,11 +10,14 @@ from contextlib import redirect_stdout
 from dataclasses import dataclass
 import io
 import sys
+import traceback
+import warnings
 
 from mpi4py import MPI
 import numpy as np
+from scipy.linalg import LinAlgWarning, solve_triangular
 
-from lu_serial import matrix_entries
+from lu_serial import lu_diag_block, matrix_entries
 
 
 @dataclass(frozen=True)
@@ -43,7 +47,7 @@ def validate_parameters(comm, params):
                          f'{params.pr * params.pc}.')
     if params.check:
         raise ValueError('--check está reservado para verificar LU; '
-                         'la Etapa 2 todavía no implementa LU. '
+                         'la Etapa 3 todavía no implementa LU completa. '
                          'Use tests/test_distribution.py para la distribución.')
 
 
@@ -68,7 +72,7 @@ def parse_parameters(comm, argv=None):
     parser.add_argument('--pr', type=int, required=True)
     parser.add_argument('--pc', type=int, required=True)
     parser.add_argument('--check', action='store_true',
-                        help='reservado para LU futura; se rechaza en Etapa 2')
+                        help='reservado para LU completa; se rechaza en Etapa 3')
     captured = io.StringIO()
     try:
         with redirect_stdout(captured):
@@ -210,27 +214,142 @@ class LocalMatrix:
         return cls(layout, values)
 
 
+@dataclass(frozen=True)
+class StepPanels:
+    """Paneles recibidos, en el orden de los ejes locales con bloques > k.
+
+    lower: (filas activas locales, b); upper: (b, columnas activas locales).
+    row_slice/col_slice delimitan esa misma región de LocalMatrix.values.
+    diagonal contiene LU empaquetado solo en la fila/columna propietarias;
+    fuera de esa unión es None. Los buffers son float64 C independientes
+    del almacenamiento local, incluso en los emisores. No se aplica Schur.
+    """
+    k: int
+    block_rows: np.ndarray
+    block_cols: np.ndarray
+    row_slice: slice
+    col_slice: slice
+    lower: np.ndarray
+    upper: np.ndarray
+    diagonal: np.ndarray | None
+
+
+def diagonal_panel_step(grid, local, k):
+    """Fase colectiva de UN paso k: diagonal, paneles y sus difusiones.
+
+    Precondición: todos los ranks llaman con el mismo k y con el estado
+    correcto al inicio de ese paso (Schur anteriores ya aplicados por el
+    llamador). Repetir esta función sin Schur NO produce una LU correcta.
+
+    Orden local compatible: diagonal por fila r (root=c), diagonal por
+    columna c (root=r), resolver U, resolver L, L por cada fila (root=c),
+    U por cada columna (root=r). Solo la unión de fila r y columna c recibe
+    diagonal; TODOS participan en las dos difusiones de paneles, aun vacíos.
+    No requiere barreras ni colectivas de control entre fases.
+
+    Fallos locales, incluidos ValueError/AssertionError y advertencias de
+    singularidad de LAPACK, abortan el comunicador padre con diagnóstico.
+    No se intenta una colectiva de recuperación que otros ranks no esperan.
+    """
+    phase = 'validación local'
+    try:
+        p, layout, a = grid.params, local.layout, local.values
+        if sys.flags.optimize:
+            raise RuntimeError('No usar -O: desactiva la comprobación de pivoteo del serial.')
+        if not isinstance(k, (int, np.integer)) or not 0 <= k < layout.nb:
+            raise ValueError('k debe ser un índice de bloque entre 0 y nb-1.')
+        if (layout.params != p or
+                (layout.myrow, layout.mycol) != (grid.myrow, grid.mycol)):
+            raise ValueError('Layout y grid incompatibles.')
+        if (a.shape != layout.shape or a.dtype != np.float64 or
+                not a.flags.c_contiguous or not a.flags.writeable):
+            raise ValueError('La matriz local debe ser compacta C, float64, escribible y de shape layout.shape.')
+        r, c = k % p.pr, k % p.pc
+        rs, cs = layout.active_slices(k)
+        block_rows = layout.block_rows[rs.start // p.b:]
+        block_cols = layout.block_cols[cs.start // p.b:]
+        lower = np.empty((rs.stop - rs.start, p.b), dtype=np.float64)
+        upper = np.empty((p.b, cs.stop - cs.start), dtype=np.float64)
+        diagonal = None
+        if grid.myrow == r or grid.mycol == c:
+            diagonal = np.empty((p.b, p.b), dtype=np.float64)
+
+        phase = 'factorización diagonal'
+        if (grid.myrow, grid.mycol) == (r, c):
+            diagonal[:] = a[layout.block_slices(k, k)]
+            if not np.isfinite(diagonal).all():
+                raise ValueError('Diagonal con NaN/Inf.')
+            with warnings.catch_warnings():
+                warnings.simplefilter('error', LinAlgWarning)
+                lu_diag_block(diagonal)  # Mantiene assert de pivotes identidad.
+            if not np.isfinite(diagonal).all():
+                raise FloatingPointError('LU diagonal con NaN/Inf.')
+            a[layout.block_slices(k, k)] = diagonal
+
+        phase = 'Bcast diagonal por fila'
+        if grid.myrow == r:
+            grid.row_comm.Bcast([diagonal, MPI.DOUBLE], root=c)
+        phase = 'Bcast diagonal por columna'
+        if grid.mycol == c:
+            grid.col_comm.Bcast([diagonal, MPI.DOUBLE], root=r)
+
+        phase = 'resolución panel U'
+        if grid.myrow == r and upper.size:
+            kr = slice((k // p.pr) * p.b, (k // p.pr + 1) * p.b)
+            upper[:] = solve_triangular(diagonal, a[kr, cs], lower=True,
+                                        unit_diagonal=True, check_finite=False)
+            if not np.isfinite(upper).all():
+                raise FloatingPointError('Panel U con NaN/Inf.')
+            a[kr, cs] = upper
+
+        phase = 'resolución panel L'
+        if grid.mycol == c and lower.size:
+            kc = slice((k // p.pc) * p.b, (k // p.pc + 1) * p.b)
+            lower[:] = solve_triangular(diagonal, a[rs, kc].T, trans='T',
+                                        lower=False, check_finite=False).T
+            if not np.isfinite(lower).all():
+                raise FloatingPointError('Panel L con NaN/Inf.')
+            a[rs, kc] = lower
+
+        phase = 'Bcast panel L por fila'
+        grid.row_comm.Bcast([lower, MPI.DOUBLE], root=c)
+        phase = 'Bcast panel U por columna'
+        grid.col_comm.Bcast([upper, MPI.DOUBLE], root=r)
+        return StepPanels(k, block_rows, block_cols, rs, cs, lower, upper, diagonal)
+    except Exception:
+        print(f'Error en diagonal_panel_step: rank={grid.rank} '
+              f'coords=({grid.myrow},{grid.mycol}) k={k} fase={phase}; MPI Abort(1)',
+              file=sys.stderr, flush=True)
+        traceback.print_exc()
+        sys.stderr.flush()
+        grid.comm.Abort(1)
+        raise  # Solo alcanzable si un comunicador de prueba retorna de Abort.
+
+
 def main(argv=None):
     comm = MPI.COMM_WORLD
     try:
-        params = parse_parameters(comm, argv)
+        # Solo los errores colectivos iniciales admiten una salida normal 2.
+        # Un ValueError posterior es local y debe seguir la rama Abort.
+        try:
+            params = parse_parameters(comm, argv)
+        except ValueError as exc:
+            if comm.Get_rank() == 0:
+                print(f'Error: {exc}', file=sys.stderr)
+            return 2
         if params is None:
             return 0
         grid = ProcessGrid.create(comm, params)
         local = LocalMatrix.initialize(grid)
         if comm.Get_rank() == 0:
-            print(f'Etapa 2: inicialización local N={params.N} b={params.b} '
+            print(f'Etapa 3: inicialización local N={params.N} b={params.b} '
                   f'grid={params.pr}x{params.pc}; LU no implementada.')
         # Mantener el almacenamiento disponible para las siguientes etapas.
         del local
         grid.free()
         return 0
-    except ValueError as exc:
-        if comm.Get_rank() == 0:
-            print(f'Error: {exc}', file=sys.stderr)
-        return 2
     except Exception as exc:
-        print(f'Error inesperado en rank {comm.Get_rank()}: {exc}', file=sys.stderr,
+        print(f'Error inesperado en rank {comm.Get_rank()}: {exc}; MPI Abort(1)', file=sys.stderr,
               flush=True)
         comm.Abort(1)  # Un fallo local no deja a otros ranks en una colectiva.
 
