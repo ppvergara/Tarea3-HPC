@@ -5,6 +5,8 @@ Implementación de factorización LU distribuida mediante **MPI4PY, NumPy y SciP
 
 El repositorio incluye la versión serial de referencia y una implementación paralela con distribución bloque-cíclica bidimensional.
 
+Guía práctica para el grupo y resultados seriales aprobados de A: [docs/HANDOFF_B.md](docs/HANDOFF_B.md).
+
 ## 1. Archivos principales
 
 - `lu_serial.py`: implementación serial de referencia.
