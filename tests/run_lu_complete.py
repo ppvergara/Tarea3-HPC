@@ -111,8 +111,8 @@ def main():
                 if proc.returncode != 0 or stderr:
                     raise ValueError('Salida no cero o stderr inesperado')
                 if cli:
-                    if 'LU distribuida finalizada' not in stdout or f'grid={pr}x{pc}' not in stdout:
-                        raise ValueError('CLI no informa finalización esperada')
+                    from run_metrics import validate_output, strict_json
+                    validate_output(strict_json(stdout), config, 'not_run')
                 else:
                     result = json.loads(stdout)
                     if not result['passed'] or [result[k] for k in ('N','b','pr','pc')] != config:

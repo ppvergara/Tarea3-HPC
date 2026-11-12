@@ -132,8 +132,12 @@ def main():
                     record['noncontiguous_active_views'] = sum(
                         not region['c_contiguous'] and all(region['shape'])
                         for r in result['ranks'] for region in r['active'])
-                elif category == 'cli' and 'LU distribuida finalizada' not in stdout:
-                    raise ValueError('Falta diagnóstico de finalización de LU')
+                elif category == 'cli':
+                    from run_metrics import validate_output, strict_json
+                    validate_output(strict_json(stdout), [32,8,2,2], 'not_run')
+                elif category == 'check':
+                    from run_metrics import validate_output, strict_json
+                    validate_output(strict_json(stdout), [16,8,1,2], 'passed')
                 elif category == 'help' and '--pr' not in stdout:
                     raise ValueError('Falta ayuda')
             record['status'] = 'passed'
@@ -158,7 +162,7 @@ def main():
     for name, flags, message in [
         ('nondivisible', ['--N','17',*base[2:]], 'N debe ser divisible'),
         ('size_mismatch', [*base[:5],'2',*base[6:]], 'size=2 debe ser pr*pc=4'),
-        ('check_reserved', [*base,'--check'], '--check está reservado'),
+        ('check_over_limit', ['--N','272','--b','16',*base[4:],'--check'], '--check requiere N <= 256'),
         ('unknown', [*base,'--unknown'], 'unrecognized arguments'),
         ('integer', ['--N','abc',*base[2:]], 'invalid int value'),
         ('missing_grid', ['--N','16','--b','8'], 'required')]:
@@ -175,6 +179,7 @@ def main():
             2, 'negative', expected_error=message)
     run('cli_2x2', [launcher,'-n','4',*program,'--N','32','--b','8','--pr','2','--pc','2'],
         4, 'cli')
+    run('check_small', [launcher,'-n','2',*program,*base,'--check'], 2, 'check')
     run('help', [launcher,'-n','2',*program,'--help'], 2, 'help')
     summary['counts'] = {s:sum(r['status']==s for r in summary['cases'])
                          for s in ['passed','failed','not_run']}

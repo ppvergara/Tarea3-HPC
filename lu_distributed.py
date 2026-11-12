@@ -1,23 +1,62 @@
-"""LU distribuida bloque-cíclica funcional (Etapa 4, sin tiempos definitivos).
+"""LU distribuida bloque-cíclica con métricas por rank y salida JSON 1.0.
 
 Ejemplo: mpiexec -n 4 python lu_distributed.py --N 32 --b 8 --pr 2 --pc 2
 La CLI factoriza in-place mediante diagonal/paneles y Schur local.
-Hilos BLAS configurados externamente. Verificación numérica en tests/.
+Hilos BLAS configurados externamente. --check admite N <= 256.
 """
 
 import argparse
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import hashlib
 import io
+import json
+import math
+import os
+from pathlib import Path
+import platform
+import subprocess
 import sys
+import time
 import traceback
+import uuid
 import warnings
 
+import mpi4py
 from mpi4py import MPI
 import numpy as np
+import scipy
 from scipy.linalg import LinAlgWarning, solve_triangular
 
-from lu_serial import lu_diag_block, matrix_entries
+from lu_serial import lu_blocked, lu_diag_block, matrix_entries, residual
+
+
+CHECK_MAX_N = 256
+CHECK_TOLERANCE = 1e-10
+TIME_TOLERANCE_S = 1e-9  # Un tick del reloj observado; no se corrigen los datos.
+THREAD_VARIABLES = ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS')
+
+
+@dataclass
+class RankTimers:
+    """Acumulador nuevo por factorización; todos los intervalos usan perf_counter."""
+    compute_s: float = 0.0
+    communication_s: float = 0.0
+    total_s: float = 0.0
+
+
+@contextmanager
+def _measure(timers, field):
+    if timers is None:
+        yield
+        return
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        elapsed = time.perf_counter() - start
+        setattr(timers, field, getattr(timers, field) + elapsed)
 
 
 @dataclass(frozen=True)
@@ -45,10 +84,8 @@ def validate_parameters(comm, params):
     if comm.Get_size() != params.pr * params.pc:
         raise ValueError(f'COMM_WORLD size={comm.Get_size()} debe ser pr*pc='
                          f'{params.pr * params.pc}.')
-    if params.check:
-        raise ValueError('--check está reservado para verificar LU; '
-                         'su integración corresponde a la Etapa 5. '
-                         'Use tests/test_lu_complete.py para verificar la Etapa 4.')
+    if params.check and params.N > CHECK_MAX_N:
+        raise ValueError(f'--check requiere N <= {CHECK_MAX_N}; recibido N={params.N}.')
 
 
 class _ParseExit(Exception):
@@ -72,7 +109,7 @@ def parse_parameters(comm, argv=None):
     parser.add_argument('--pr', type=int, required=True)
     parser.add_argument('--pc', type=int, required=True)
     parser.add_argument('--check', action='store_true',
-                        help='reservado para Etapa 5; usar tests/test_lu_complete.py')
+                        help=f'verifica factores y residuo frente al serial (N <= {CHECK_MAX_N})')
     captured = io.StringIO()
     try:
         with redirect_stdout(captured):
@@ -234,7 +271,7 @@ class StepPanels:
     diagonal: np.ndarray | None
 
 
-def diagonal_panel_step(grid, local, k):
+def diagonal_panel_step(grid, local, k, timers=None):
     """Fase colectiva de UN paso k: diagonal, paneles y sus difusiones.
 
     Precondición: todos los ranks llaman con el mismo k y con el estado
@@ -281,23 +318,27 @@ def diagonal_panel_step(grid, local, k):
                 raise ValueError('Diagonal con NaN/Inf.')
             with warnings.catch_warnings():
                 warnings.simplefilter('error', LinAlgWarning)
-                lu_diag_block(diagonal)  # Mantiene assert de pivotes identidad.
+                with _measure(timers, 'compute_s'):
+                    lu_diag_block(diagonal)  # Mantiene assert de pivotes identidad.
             if not np.isfinite(diagonal).all():
                 raise FloatingPointError('LU diagonal con NaN/Inf.')
             a[layout.block_slices(k, k)] = diagonal
 
         phase = 'Bcast diagonal por fila'
         if grid.myrow == r:
-            grid.row_comm.Bcast([diagonal, MPI.DOUBLE], root=c)
+            with _measure(timers, 'communication_s'):
+                grid.row_comm.Bcast([diagonal, MPI.DOUBLE], root=c)
         phase = 'Bcast diagonal por columna'
         if grid.mycol == c:
-            grid.col_comm.Bcast([diagonal, MPI.DOUBLE], root=r)
+            with _measure(timers, 'communication_s'):
+                grid.col_comm.Bcast([diagonal, MPI.DOUBLE], root=r)
 
         phase = 'resolución panel U'
         if grid.myrow == r and upper.size:
             kr = slice((k // p.pr) * p.b, (k // p.pr + 1) * p.b)
-            upper[:] = solve_triangular(diagonal, a[kr, cs], lower=True,
-                                        unit_diagonal=True, check_finite=False)
+            with _measure(timers, 'compute_s'):
+                upper[:] = solve_triangular(diagonal, a[kr, cs], lower=True,
+                                            unit_diagonal=True, check_finite=False)
             if not np.isfinite(upper).all():
                 raise FloatingPointError('Panel U con NaN/Inf.')
             a[kr, cs] = upper
@@ -305,16 +346,19 @@ def diagonal_panel_step(grid, local, k):
         phase = 'resolución panel L'
         if grid.mycol == c and lower.size:
             kc = slice((k // p.pc) * p.b, (k // p.pc + 1) * p.b)
-            lower[:] = solve_triangular(diagonal, a[rs, kc].T, trans='T',
-                                        lower=False, check_finite=False).T
+            with _measure(timers, 'compute_s'):
+                lower[:] = solve_triangular(diagonal, a[rs, kc].T, trans='T',
+                                            lower=False, check_finite=False).T
             if not np.isfinite(lower).all():
                 raise FloatingPointError('Panel L con NaN/Inf.')
             a[rs, kc] = lower
 
         phase = 'Bcast panel L por fila'
-        grid.row_comm.Bcast([lower, MPI.DOUBLE], root=c)
+        with _measure(timers, 'communication_s'):
+            grid.row_comm.Bcast([lower, MPI.DOUBLE], root=c)
         phase = 'Bcast panel U por columna'
-        grid.col_comm.Bcast([upper, MPI.DOUBLE], root=r)
+        with _measure(timers, 'communication_s'):
+            grid.col_comm.Bcast([upper, MPI.DOUBLE], root=r)
         return StepPanels(k, block_rows, block_cols, rs, cs, lower, upper, diagonal)
     except Exception:
         print(f'Error en diagonal_panel_step: rank={grid.rank} '
@@ -326,7 +370,7 @@ def diagonal_panel_step(grid, local, k):
         raise  # Solo alcanzable si un comunicador de prueba retorna de Abort.
 
 
-def schur_update(local, panels):
+def schur_update(local, panels, timers=None):
     """Actualizar in-place SOLO los bloques i,j > panels.k, sin comunicación.
 
     Consume StepPanels del paso actual: lower (m,b), upper (b,n) y los
@@ -356,12 +400,13 @@ def schur_update(local, panels):
     # NumPy escribe sobre la vista original aun cuando no sea C contigua.
     # El único temporal grande es el producto (m,n), sin copia previa de active.
     with np.errstate(over='raise', invalid='raise'):
-        active -= panels.lower @ panels.upper
+        with _measure(timers, 'compute_s'):
+            active -= panels.lower @ panels.upper
     if not np.isfinite(active).all():
         raise FloatingPointError('Actualización de Schur con NaN/Inf.')
 
 
-def lu_blocked_distributed(grid, local):
+def lu_blocked_distributed(grid, local, timers=None):
     """LU completa in-place; todos los ranks recorren k=0,...,nb-1.
 
     Requiere matriz original local, grid/layout compatibles y parámetros
@@ -375,9 +420,13 @@ def lu_blocked_distributed(grid, local):
             raise ValueError('Layout y grid incompatibles para LU completa.')
         for k in range(grid.params.N // grid.params.b):
             phase = 'diagonal/paneles'
-            panels = diagonal_panel_step(grid, local, k)
+            panels = (diagonal_panel_step(grid, local, k) if timers is None else
+                      diagonal_panel_step(grid, local, k, timers=timers))
             phase = 'actualización de Schur'
-            schur_update(local, panels)
+            if timers is None:
+                schur_update(local, panels)
+            else:
+                schur_update(local, panels, timers=timers)
     except Exception:
         print(f'Error en lu_blocked_distributed: rank={grid.rank} '
               f'coords=({grid.myrow},{grid.mycol}) k={k} fase={phase}; MPI Abort(1)',
@@ -386,6 +435,158 @@ def lu_blocked_distributed(grid, local):
         sys.stderr.flush()
         grid.comm.Abort(1)
         raise
+
+
+def measure_factorization(grid, local):
+    """Único intervalo total: Barrier de preparación fuera; sin Barrier final."""
+    timers = RankTimers()
+    grid.comm.Barrier()
+    start = time.perf_counter()
+    lu_blocked_distributed(grid, local, timers=timers)
+    timers.total_s = time.perf_counter() - start
+    return timers
+
+
+def rank_environment():
+    """Consulta previa a Barrier; no impone hilos ni requiere threadpoolctl."""
+    try:
+        from threadpoolctl import threadpool_info
+        pools = threadpool_info()
+    except ImportError:
+        pools = None
+    return dict(hostname=MPI.Get_processor_name(),
+                thread_env={key: os.environ.get(key) for key in THREAD_VARIABLES},
+                blas_pools=pools)
+
+
+def execution_metadata():
+    """Identidad de root fuera de LU; hash distingue cambios sin commit."""
+    directory = Path(__file__).resolve().parent
+    def git(*args):
+        try:
+            result = subprocess.run(['git', '-C', str(directory), *args],
+                                    capture_output=True, text=True, timeout=2)
+            return result.stdout.strip() if result.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+    status = git('status', '--porcelain=v1')
+    return dict(run_id=str(uuid.uuid4()),
+                started_at=datetime.now(timezone.utc).isoformat(),
+                code=dict(git_commit=git('rev-parse', 'HEAD'),
+                          git_dirty=None if status is None else bool(status),
+                          sha256={name: hashlib.sha256((directory/name).read_bytes()).hexdigest()
+                                  for name in ('lu_distributed.py', 'lu_serial.py')}),
+                environment=dict(python=sys.version, executable=sys.executable,
+                                 numpy=np.__version__, scipy=scipy.__version__,
+                                 mpi4py=mpi4py.__version__, mpi_library=MPI.Get_library_version(),
+                                 platform=platform.platform(),
+                                 thread_policy='external; requested values recorded per rank',
+                                 clock='time.perf_counter',
+                                 clock_resolution_s=time.get_clock_info('perf_counter').resolution,
+                                 time_tolerance_s=TIME_TOLERANCE_S))
+
+
+def validate_rank_times(params, rank_times):
+    """Validación en root después de gather; conserva floats y ordena ranks."""
+    p = params.pr * params.pc
+    if len(rank_times) != p:
+        raise ValueError('Métricas: falta algún rank.')
+    ranks = [r['rank'] for r in rank_times]
+    if any(type(r) is not int for r in ranks) or sorted(ranks) != list(range(p)):
+        raise ValueError('Métricas: ranks duplicados o fuera de rango.')
+    ordered = sorted(rank_times, key=lambda r: r['rank'])
+    for record in ordered:
+        row, col = divmod(record['rank'], params.pc)
+        if (type(record['row']) is not int or type(record['col']) is not int or
+                (record['row'], record['col']) != (row, col)):
+            raise ValueError('Métricas: coordenadas incompatibles con rank.')
+        for field in ('compute_s', 'communication_s', 'total_s'):
+            value = record[field]
+            if type(value) not in (float, int) or not math.isfinite(value) or value < 0:
+                raise ValueError(f'Métricas: {field} debe ser finito y no negativo.')
+        overhead = record['total_s'] - record['compute_s'] - record['communication_s']
+        if overhead < -TIME_TOLERANCE_S:
+            raise ValueError('Métricas: cómputo + comunicación exceden total_s.')
+        record['unaccounted_s'] = overhead
+    return ordered
+
+
+def collect_rank_times(grid, timers, environment):
+    record = dict(rank=grid.rank, row=grid.myrow, col=grid.mycol,
+                  compute_s=timers.compute_s, communication_s=timers.communication_s,
+                  total_s=timers.total_s, **environment)
+    records = grid.comm.gather(record, root=0)
+    return validate_rank_times(grid.params, records) if grid.rank == 0 else None
+
+
+def reconstruct_factors(params, payload):
+    """Diagnóstico pequeño exclusivo de root, con ejes derivados de rank."""
+    if params.N > CHECK_MAX_N:
+        raise ValueError(f'Reconstrucción limitada a N <= {CHECK_MAX_N}.')
+    if len(payload) != params.pr * params.pc:
+        raise ValueError('Reconstrucción: faltan ranks.')
+    factors = np.full((params.N, params.N), np.nan)
+    coverage = np.zeros((params.N, params.N), dtype=np.uint8)
+    indices = np.arange(params.N)
+    for rank, data in enumerate(payload):
+        row, col = divmod(rank, params.pc)
+        rows = indices[indices // params.b % params.pr == row]
+        cols = indices[indices // params.b % params.pc == col]
+        if data.shape != (len(rows), len(cols)) or not np.isfinite(data).all():
+            raise ValueError('Reconstrucción: shape o finitud local inválida.')
+        factors[np.ix_(rows, cols)] = data
+        coverage[np.ix_(rows, cols)] += 1
+    if not np.all(coverage == 1) or not np.isfinite(factors).all():
+        raise ValueError('Reconstrucción: cobertura o finitud inválida.')
+    return factors
+
+
+def check_numerical(params, factors):
+    """No modifica factors. Criterios fijados: ambos relativos <= 1e-10."""
+    if params.N > CHECK_MAX_N:
+        raise ValueError(f'Comprobación limitada a N <= {CHECK_MAX_N}.')
+    if factors.shape != (params.N, params.N) or not np.isfinite(factors).all():
+        raise ValueError('Comprobación: shape o finitud global inválida.')
+    original = matrix_entries(range(params.N), range(params.N), params.N)
+    reference = original.copy()
+    lu_blocked(reference, params.b)
+    if reference.shape != factors.shape or not np.isfinite(reference).all():
+        raise ValueError('Comprobación: referencia serial inválida.')
+    delta = factors - reference
+    norm = float(np.linalg.norm(reference))
+    if not norm:
+        raise ValueError('Comprobación: norma serial cero.')
+    rd = float(residual(original, factors))
+    difference = float(np.linalg.norm(delta)) / norm
+    maximum = float(np.max(np.abs(delta)))
+    if not all(math.isfinite(x) for x in (rd, difference, maximum)):
+        raise ValueError('Comprobación: métricas numéricas NaN/Inf.')
+    passed = rd <= CHECK_TOLERANCE and difference <= CHECK_TOLERANCE
+    return dict(status='passed' if passed else 'failed', relative_residual=rd,
+                relative_factor_difference=difference, max_absolute_factor_difference=maximum,
+                residual_tolerance=CHECK_TOLERANCE, factor_tolerance=CHECK_TOLERANCE,
+                max_N=CHECK_MAX_N)
+
+
+def verify_factorization(grid, local):
+    """Gather diagnóstico y bcast de estado, siempre posteriores al total."""
+    if not grid.params.check:
+        return dict(status='not_run')
+    if grid.params.N > CHECK_MAX_N:
+        raise ValueError(f'--check requiere N <= {CHECK_MAX_N}.')
+    payload = grid.comm.gather(local.values, root=0)
+    result = None
+    if grid.rank == 0:
+        # Excepciones inesperadas siguen la política Abort de main.
+        result = check_numerical(grid.params, reconstruct_factors(grid.params, payload))
+    return grid.comm.bcast(result, root=0)
+
+
+def build_output(params, metadata, rank_times, check):
+    ordered = validate_rank_times(params, rank_times)
+    return dict(schema_version='1.0', **metadata,
+                N=params.N, b=params.b, pr=params.pr, pc=params.pc, p=params.pr*params.pc,
+                wall_s=max(r['total_s'] for r in ordered), rank_times=ordered, check=check)
 
 
 def main(argv=None):
@@ -403,12 +604,19 @@ def main(argv=None):
             return 0
         grid = ProcessGrid.create(comm, params)
         local = LocalMatrix.initialize(grid)
-        lu_blocked_distributed(grid, local)
+        environment = rank_environment()
+        metadata = execution_metadata() if grid.rank == 0 else None
+        timers = measure_factorization(grid, local)
+        rank_times = collect_rank_times(grid, timers, environment)
+        check = verify_factorization(grid, local)
+        if grid.rank == 0:
+            result = build_output(params, metadata, rank_times, check)
+            print(json.dumps(result, allow_nan=False))
+            if check['status'] == 'failed':
+                print('Error: --check failed; corrida no válida para rendimiento.',
+                      file=sys.stderr, flush=True)
         grid.free()
-        if comm.Get_rank() == 0:
-            print(f'Etapa 4: LU distribuida finalizada N={params.N} b={params.b} '
-                  f'grid={params.pr}x{params.pc}; verificación independiente en tests/.')
-        return 0
+        return 1 if check['status'] == 'failed' else 0
     except Exception as exc:
         print(f'Error inesperado en rank {comm.Get_rank()}: {exc}; MPI Abort(1)', file=sys.stderr,
               flush=True)

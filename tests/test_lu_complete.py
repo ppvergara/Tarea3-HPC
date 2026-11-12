@@ -209,10 +209,10 @@ def failure_scenario(grid, local, scenario):
         return original(current_local, panels)
     distributed.schur_update = broken
     if scenario == 'main_schur':
-        def fail(current_local, panels):
+        def fail(current_local, panels, timers=None):
             if grid.rank == 2:
                 raise ValueError('fallo Schur desde main')
-            return original(current_local, panels)
+            return original(current_local, panels, timers=timers)
         distributed.schur_update = fail
         return distributed.main(['--N','32','--b','8','--pr','2','--pc','2'])
     distributed.lu_blocked_distributed(grid, local)
