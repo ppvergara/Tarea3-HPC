@@ -1,0 +1,61 @@
+
+# ==========================================
+# Archivos locales de trabajo
+# ==========================================
+.local/
+
+# ==========================================
+# Entornos virtuales y configuraciones privadas
+# ==========================================
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# ==========================================
+# Python: cachés y archivos generados
+# ==========================================
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ==========================================
+# Archivos temporales y del editor
+# ==========================================
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+
+# ==========================================
+# Ejecuciones locales y SLURM
+# ==========================================
+/logs/
+/tmp/
+/temp/
+/slurm-*.out
+/slurm-*.err
+/core
+/core.*
+
+# ==========================================
+# Resultados experimentales
+# ==========================================
+/results/*
+
+# Permitir resultados oficiales compartidos
+!/results/oficiales/
+!/results/comparativos/
+
+# ==========================================
+# Archivos binarios temporales de experimentos
+# ==========================================
+*.npy
+*.npz
